@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # mockllm: scriptable fake openai-compatible chat completions server.
 # stdlib only. serves POST /v1/chat/completions and GET /v1/models
-# on 127.0.0.1. see README.md for the scenario format.
+# on 127.0.0.1. requests with "stream": true get fake sse chunks.
+# see README.md for the scenario format.
 
 import argparse
 import json
 import random
+import re
 import sys
 import threading
 import time
@@ -81,6 +83,27 @@ def error_payload(err, status):
                       "type": "mockllm_error", "code": status}}
 
 
+def stream_chunks(model, payload):
+    # turn a chat completion into openai-style sse chunks. content goes
+    # out word by word, tool calls ride one delta chunk, then the final
+    # chunk carries the finish reason. keeps exact whitespace.
+    msg = payload["choices"][0]["message"]
+    head = {
+        "id": payload["id"], "object": "chat.completion.chunk",
+        "created": payload["created"], "model": model,
+    }
+    for piece in re.findall(r"\S+\s*|\s+", msg.get("content") or ""):
+        yield dict(head, choices=[{"index": 0, "delta": {
+            "role": "assistant", "content": piece},
+            "finish_reason": None}])
+    delta = {"role": "assistant"}
+    if msg.get("tool_calls"):
+        delta["tool_calls"] = msg["tool_calls"]
+    finish = payload["choices"][0].get("finish_reason") or "stop"
+    yield dict(head, choices=[{"index": 0, "delta": delta,
+                               "finish_reason": finish}])
+
+
 def decide(state, body, latency_default, model):
     # returns (status, payload, latency_ms). caller sleeps outside the lock.
     msgs = body.get("messages") or []
@@ -138,6 +161,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_stream(self, model, payload):
+        # fake sse: chunk events, then data: [DONE], then close
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        for chunk in stream_chunks(model, payload):
+            self.wfile.write(
+                ("data: %s\n\n" % json.dumps(chunk)).encode())
+            self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
     def do_GET(self):
         if self.path.rstrip("/") == "/v1/models":
             m = self.server.mock
@@ -180,7 +216,11 @@ class Handler(BaseHTTPRequestHandler):
                                              m.model)
         if latency:
             time.sleep(latency / 1000.0)
-        self.send_json(status, payload)
+        if body.get("stream") and status == 200:
+            # streaming clients get sse; errors stay plain json
+            self.send_stream(m.model, payload)
+        else:
+            self.send_json(status, payload)
 
 
 def make_server(port, state, record_path=None, latency_ms=0, model=DEFAULT_MODEL):
