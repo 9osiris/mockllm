@@ -62,6 +62,20 @@ Step kinds:
 
 When the steps run out, the server falls back to echo mode.
 
+## streaming
+
+Send `"stream": true` in the request and mockllm answers with
+server-sent events instead of json: one chunk per word, a final
+chunk carrying `finish_reason`, then `data: [DONE]`. Tool calls
+stream as a single delta chunk with `finish_reason: tool_calls`.
+Errors still come back as plain json, same as real APIs.
+
+```sh
+curl -N http://127.0.0.1:8471/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mockllm","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
 ## cli
 
 ```sh
