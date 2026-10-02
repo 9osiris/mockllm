@@ -260,6 +260,89 @@ def test_load_scenario_rejects_junk():
         os.unlink(path)
 
 
+def sse_post(base, body):
+    req = urllib.request.Request(
+        base + "/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+        return r.status, r.headers.get("Content-Type", ""), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Content-Type", ""), e.read().decode()
+
+
+def parse_sse(raw):
+    events = []
+    for block in raw.strip().split("\n\n"):
+        for line in block.splitlines():
+            if line.startswith("data: "):
+                events.append(line[len("data: "):])
+    return events
+
+
+def test_stream_reassembles_content():
+    base = serve([{"reply": "hello streamed  world"}])
+    status, ctype, raw = sse_post(
+        base, chat([{"role": "user", "content": "hi"}], stream=True))
+    check(status == 200, "stream status %r" % status)
+    check("text/event-stream" in ctype, "sse content type: %r" % ctype)
+    events = parse_sse(raw)
+    check(len(events) > 2, "more than one content chunk: %d" % len(events))
+    check(events[-1] == "[DONE]", "stream ends with [DONE]")
+    text, finish = "", None
+    for e in events[:-1]:
+        d = json.loads(e)
+        check(d["object"] == "chat.completion.chunk", "chunk object")
+        check(d["model"] == "mockllm", "chunk carries model")
+        delta = d["choices"][0]["delta"]
+        text += delta.get("content", "")
+        if d["choices"][0]["finish_reason"]:
+            finish = d["choices"][0]["finish_reason"]
+    check(text == "hello streamed  world", "reassembled exactly: %r" % text)
+    check(finish == "stop", "final finish reason %r" % finish)
+
+
+def test_stream_tool_calls():
+    steps = [{"reply": "looking", "tool_calls": [
+        {"name": "read_file", "arguments": {"path": "a.py"}}]}]
+    base = serve(steps)
+    status, _, raw = sse_post(
+        base, chat([{"role": "user", "content": "go"}], stream=True))
+    check(status == 200, "stream status %r" % status)
+    events = parse_sse(raw)
+    check(events[-1] == "[DONE]", "stream ends with [DONE]")
+    chunks = [json.loads(e) for e in events[:-1]]
+    carried = [c["choices"][0]["delta"].get("tool_calls")
+               for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+    check(len(carried) == 1, "one chunk carries the tool calls")
+    check(carried[0][0]["function"]["name"] == "read_file",
+          "tool name streams")
+    check(chunks[-1]["choices"][0]["finish_reason"] == "tool_calls",
+          "tool_calls finish reason")
+
+
+def test_stream_error_stays_json():
+    base = serve([{"error": {"status": 429, "message": "slow",
+                             "once": True}}])
+    status, ctype, raw = sse_post(
+        base, chat([{"role": "user", "content": "hi"}], stream=True))
+    check(status == 429, "error status %r" % status)
+    check("application/json" in ctype, "errors are json, not sse: %r" % ctype)
+    check(json.loads(raw)["error"]["message"] == "slow", "error message")
+
+
+def test_stream_echo_when_steps_run_out():
+    base = serve()
+    status, _, raw = sse_post(
+        base, chat([{"role": "user", "content": "ping"}], stream=True))
+    check(status == 200, "stream status %r" % status)
+    events = parse_sse(raw)
+    text = "".join(json.loads(e)["choices"][0]["delta"].get("content", "")
+                   for e in events[:-1])
+    check("mockllm echo" in text, "echo mode streams too")
+    check(events[-1] == "[DONE]", "stream ends with [DONE]")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_")]
